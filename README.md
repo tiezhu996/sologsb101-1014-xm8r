@@ -42,7 +42,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 构建 | Vite 5 | 开发端口与宿主端口一致（22814） |
 | 路由 | React Router 6 | `createBrowserRouter` + 路由懒加载 |
 | 状态管理 | Zustand 4 | 跨页状态集中在 store，页面只读 store |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbmangrove`，含 v1 → v2 升级迁移 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbmangrove`，含 v1 → v2 → v3 升级迁移 |
 | 时间处理 | dayjs | |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
@@ -87,8 +87,8 @@ sologsb101-1014/
 | `/plots` | `pages/PlotList.tsx` | 修复地块台账：新建/编辑/级联删除、按潮位带与底质筛选、回显栽植总株数与最新成活率 |
 | `/plots/:id/seedlings` | `pages/SeedlingBoard.tsx` | 苗木批次与来源登记、批次数量累计校验（含密度提示） |
 | `/plots/:id/plantings` | `pages/PlantingEntry.tsx` | 栽植记录：录株距与株数、按面积与株距校验密度合理性 |
-| `/surveys` | `pages/SurveyBoard.tsx` | 成活率与株高验收台：按测次录入、自动算成活率、低于阈值告警、批量调整成活率等级 |
-| `/replants` | `pages/ReplantPlan.tsx` | 补植计划：状态流转（待补植→已补植→已复核）、行内草稿、JSON 导入导出、结构版本查看 |
+| `/surveys` | `pages/SurveyBoard.tsx` | 成活率与株高验收台：按测次录入并固定当次株数、失效复核（保留 / 重算）、待补证补录、低于阈值告警、批量调整等级 |
+| `/replants` | `pages/ReplantPlan.tsx` | 补植计划：来源测次溯源与有效范围、状态流转（待补植→已补植→已复核）、行内草稿、outbox 失败重试、JSON 导入导出、结构版本查看 |
 
 `/` 重定向到 `/plots`，未匹配路径统一回落到 `/plots`。
 **层级路由支持直接深链**：把 `http://localhost:22814/plots/plot-donggang-3/seedlings` 直接粘贴到地址栏即可打开；
@@ -100,11 +100,18 @@ sologsb101-1014/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbmangrove`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移：
-  * 为 `plots` 增加 `updatedAt`、`surveys` 增加 `[plotId+round]` 复合索引、`plantings` 增加 `spacingM` 索引等；
-  * 回填 `revision` / `createdAt` / `updatedAt`；
-  * 为 `plots` 补齐 `missingCount`、`lastReplantDate` 回写字段；
-  * 为 `surveys` 补齐 `grade`、`gradeManual` 字段（按 `survivalRate` 自动判定等级）。
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`，`version(1)` 建立全部表，`version(2)` 补齐索引，`version(3)` 落地
+  「验收固定口径 + 补植溯源 + 补偿队列」并执行 `.upgrade()` 迁移：
+  * **验收固定当次株数**：`surveys` 增加 `plantedCount`（验收保存时的栽植总株数快照）、
+    `validity`（`valid` 有效 / `invalid` 失效待复核 / `pending_evidence` 待补证）及复核留痕字段；
+    成活率统一按「成活株数 ÷ plantedCount」计算，不随后续栽植补录 / 修订漂移。
+    迁移时能由当前株数反推出原成活率的自动回填并保持有效，否则留在「待补证」。
+  * **补植计划溯源**：`replants` 增加 `sourceSurveyId`、`sourceMissingCount`（来源验收与当时缺株）、
+    `replantedCount`、`completedDate`；旧计划按计划日期就近匹配来源验收。
+  * **补偿队列**：新增 `outbox` 表；栽植记录变化的级联写入（验收失效 → 计划退出有效范围 → 缺株对账）
+    与业务行同事务登记，失败保留并指数退避重试，启动时与补植计划页均可继续重试。
+  * 迁移最后把地块 `missingCount` 与有效补植计划逐株对账重算。
+  * v1 → v2 的历史迁移（`updatedAt`、复合索引、`grade` 等）保持不变。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -112,8 +119,9 @@ sologsb101-1014/
   | `plots` | id | name, tideZone, substrate, restoreMode, state, createdAt, updatedAt |
   | `seedlings` | id | plotId, species, source, arrivalDate, quantity |
   | `plantings` | id | plotId, seedlingId, plantDate, spacingM |
-  | `surveys` | id | plotId, [plotId+round], date, grade |
-  | `replants` | id | plotId, planDate, state, species |
+  | `surveys` | id | plotId, [plotId+round], date, grade, validity |
+  | `replants` | id | plotId, planDate, state, species, sourceSurveyId |
+  | `outbox` | id（同地块同类任务固定 id 去重） | type, plotId, status, runAfter |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `plots` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **地块 → 苗木批次 → 栽植 → 验收 → 补植** 三层互相引用：
@@ -147,8 +155,19 @@ npm run preview      # 预览 dist 产物
 
 ## 七、核心业务规则
 
-* **成活率** = 成活株数 ÷ 该地块栽植总株数 × 100%（`src/utils/rate.ts` 统一口径）。
+* **成活率固定口径**：成活率 = 成活株数 ÷ **验收当次保存的栽植总株数快照**（`plantedCount`），
+  统一在 `src/utils/rate.ts` 计算。每次验收保存即固定，之后补录 / 修订栽植记录不会自动改写历史成活率。
+* **栽植变化 → 验收失效**：补录、修订或删除栽植记录（含删除被引用的苗木批次）后，同地块的有效验收
+  自动置为「失效待复核」（同事务 + `outbox` 补偿，失败可继续重试）；已经复核保留的测次在再次变化时会被重新失效。
+* **复核决策**：失效测次可在验收台选择「保留原测次」（沿用固定株数快照）或「按新株数重算」
+  （以当前栽植总株数重锚快照）；旧数据升级时无法证明株数的测次留在「待补证」，补录当次株数后恢复有效。
+* **补植计划溯源**：由验收生成的计划记录来源验收与当时缺株；来源测次失效 / 删除 / 待补证时，
+  **待补植**计划退出有效范围（不再计入缺株），来源复核恢复有效后自动重新计入；
+  **已补植 / 已复核**计划始终保留用于留痕对账，不随来源失效而删除。
+* **缺株逐株对账**：地块缺株数 = 该地块全部「有效待补植」计划缺株数之和，在验收复核、计划增删改、
+  补植完成、存档导入及启动时统一重算；地块台账展示账实差额，可在补植计划页一键重试对账。
 * **成活率等级**：≥ 85% 优，70%–85% 良，50%–70% 一般，< 50% 差；低于 50% 视为告警，建议生成补植计划。
+  （仅对有效测次判定，失效 / 待补证测次不参与统计与告警。）
 * **密度合理性**：平均单株占地面积需落在 0.6–12 ㎡/株；过密/过疏都会在栽植记录页给出提示。
-* **补植回写**：补植状态推进到「已补植」时，自动扣减地块缺株数、写入最近补植日期，
-  并按「原成活株数 + 本次补植株数」重算最新一次验收的成活率。
+* **补植回写**：补植状态推进到「已补植」时落实际补植株数与完成日期、写入最近补植日期，
+  计划退出有效范围并按上述规则逐株对账；历史验收的固定株数快照不被补植动作改写。

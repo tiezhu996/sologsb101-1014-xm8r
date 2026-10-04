@@ -11,6 +11,7 @@ import {
   DashboardOutlined,
   ExperimentOutlined,
   ToolOutlined,
+  WarningOutlined,
 } from '@ant-design/icons';
 import { ROUTES } from './router';
 import { usePlotStore } from './stores/plotStore';
@@ -82,6 +83,11 @@ export default function App() {
           <div>
             <ToolOutlined /> 补植 {counts.replants ?? 0} · 结构 v{String(counts.schemaVersion ?? '-')}
           </div>
+          {(counts.outboxPending ?? 0) > 0 ? (
+            <div style={{ color: '#ffc53d' }}>
+              <WarningOutlined /> 关联写入待重试 {counts.outboxPending} 项
+            </div>
+          ) : null}
         </div>
       </Sider>
 
@@ -109,10 +115,17 @@ export default function App() {
                 <Tag>{currentPlot.areaMu} 亩</Tag>
                 <Tag>{currentPlot.tideZone}潮位带 / {currentPlot.substrate}</Tag>
                 <Tag color="blue">栽植 {currentStat.plantTotal.toLocaleString('zh-CN')} 株</Tag>
-                <Tag color={currentStat.surveyCount === 0 ? 'default' : 'green'}>
-                  {currentStat.surveyCount === 0 ? '尚未验收' : `成活率 ${percentText(currentStat.latestRate)}`}
+                <Tag color={currentStat.validSurveyCount === 0 ? 'default' : 'green'}>
+                  {currentStat.validSurveyCount === 0
+                    ? currentStat.surveyCount > 0
+                      ? '验收待复核'
+                      : '尚未验收'
+                    : `成活率 ${percentText(currentStat.latestRate)}`}
                 </Tag>
-                <Tag color={currentPlot.missingCount > 0 ? 'orange' : 'green'}>缺株 {currentPlot.missingCount} 株</Tag>
+                <Tag color={currentPlot.missingCount > 0 ? 'orange' : 'green'}>
+                  缺株 {currentPlot.missingCount} 株
+                </Tag>
+                {currentStat.missingDrift !== 0 ? <Tag color="red">缺株待对账</Tag> : null}
               </>
             ) : (
               <Tag>未选择地块</Tag>

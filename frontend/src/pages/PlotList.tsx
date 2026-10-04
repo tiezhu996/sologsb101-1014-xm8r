@@ -17,6 +17,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
@@ -79,13 +80,17 @@ export default function PlotList() {
 
   const totals = useMemo(() => {
     const plantTotal = plots.reduce((acc, plot) => acc + statOf(plot.id).plantTotal, 0);
-    const rated = plots.filter((plot) => statOf(plot.id).surveyCount > 0);
+    const rated = plots.filter((plot) => statOf(plot.id).validSurveyCount > 0);
     const avgRate =
       rated.length === 0
         ? 0
         : Math.round((rated.reduce((acc, plot) => acc + statOf(plot.id).latestRate, 0) / rated.length) * 10) / 10;
-    const warnCount = plots.filter((plot) => statOf(plot.id).surveyCount > 0 && statOf(plot.id).latestRate < 70).length;
-    return { plantTotal, avgRate, warnCount };
+    const warnCount = plots.filter((plot) => statOf(plot.id).validSurveyCount > 0 && statOf(plot.id).latestRate < 70).length;
+    const reviewWork = plots.reduce(
+      (acc, plot) => acc + statOf(plot.id).invalidSurveyCount + statOf(plot.id).pendingEvidenceCount,
+      0,
+    );
+    return { plantTotal, avgRate, warnCount, reviewWork };
   }, [plots, statOf]);
 
   const openCreate = (): void => {
@@ -203,9 +208,24 @@ export default function PlotList() {
     {
       title: '验收测次',
       key: 'surveyCount',
-      width: 96,
+      width: 110,
       align: 'right',
-      render: (_value, record) => `${statOf(record.id).surveyCount} 次`,
+      render: (_value, record) => {
+        const stat = statOf(record.id);
+        const work = stat.invalidSurveyCount + stat.pendingEvidenceCount;
+        return (
+          <Space direction="vertical" size={0} style={{ textAlign: 'right' }}>
+            <span>
+              {stat.validSurveyCount} 有效 / 共 {stat.surveyCount} 次
+            </span>
+            {work > 0 ? (
+              <Typography.Text type="warning" style={{ fontSize: 12 }}>
+                {work} 测次待复核
+              </Typography.Text>
+            ) : null}
+          </Space>
+        );
+      },
     },
     {
       title: '最新成活率',
@@ -215,8 +235,8 @@ export default function PlotList() {
         const stat = statOf(record.id);
         return (
           <Space size={6} wrap>
-            <RateTag rate={stat.surveyCount > 0 ? stat.latestRate : null} level={stat.level} />
-            {stat.surveyCount > 0 && stat.trend !== 0 ? (
+            <RateTag rate={stat.validSurveyCount > 0 ? stat.latestRate : null} level={stat.level} />
+            {stat.validSurveyCount > 0 && stat.trend !== 0 ? (
               <Typography.Text type={stat.trend > 0 ? 'success' : 'danger'} style={{ fontSize: 12 }}>
                 {stat.trend > 0 ? <RiseOutlined /> : <FallOutlined />} {Math.abs(stat.trend)}
               </Typography.Text>
@@ -229,11 +249,28 @@ export default function PlotList() {
       title: '缺株数',
       dataIndex: 'missingCount',
       key: 'missingCount',
-      width: 96,
+      width: 130,
       align: 'right',
-      render: (value: number) => (
-        <Typography.Text type={value > 0 ? 'warning' : 'secondary'}>{value} 株</Typography.Text>
-      ),
+      render: (value: number, record) => {
+        const drift = statOf(record.id).missingDrift;
+        return (
+          <Space direction="vertical" size={0} style={{ textAlign: 'right' }}>
+            <Typography.Text type={value > 0 ? 'warning' : 'secondary'}>{value} 株</Typography.Text>
+            {drift !== 0 ? (
+              <Tooltip title={`有效待补植计划合计 ${statOf(record.id).expectedMissing} 株，差额 ${drift > 0 ? '+' : ''}${drift} 株；可到补植计划页重试对账`}>
+                <Typography.Text type="danger" style={{ fontSize: 12 }}>
+                  对账差 {drift > 0 ? '+' : ''}
+                  {drift}
+                </Typography.Text>
+              </Tooltip>
+            ) : (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                账实相符
+              </Typography.Text>
+            )}
+          </Space>
+        );
+      },
     },
     {
       title: '操作',
@@ -304,7 +341,14 @@ export default function PlotList() {
           value={totals.warnCount}
           suffix="块"
           tone={totals.warnCount > 0 ? 'danger' : 'default'}
-          hint="成活率低于 70% 的地块数量"
+          hint="最新有效成活率低于 70% 的地块数量"
+        />
+        <StatBadge
+          label="待复核 / 待补证"
+          value={totals.reviewWork}
+          suffix="测次"
+          tone={totals.reviewWork > 0 ? 'warning' : 'default'}
+          hint="栽植记录变化后失效，或旧数据无法证明当次株数的验收测次"
         />
         <StatBadge label="筛选结果" value={rows.length} suffix="块" tone="default" size="small" />
       </div>

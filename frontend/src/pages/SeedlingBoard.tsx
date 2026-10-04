@@ -29,7 +29,7 @@ import EmptyPanel from '../components/common/EmptyPanel';
 import StatBadge from '../components/common/StatBadge';
 import { useIdbTable } from '../hooks/useIdbTable';
 import { usePlotStore } from '../stores/plotStore';
-import { db } from '../utils/db';
+import { db, removeSeedling } from '../utils/db';
 import {
   SEEDLING_SOURCE_OPTIONS,
   SEEDLING_SPECIES_OPTIONS,
@@ -58,7 +58,7 @@ export default function SeedlingBoard() {
   const ready = usePlotStore((state) => state.ready);
   const plot = usePlotStore((state) => state.plots.find((item) => item.id === id));
   const plantings = usePlotStore((state) => state.plantings);
-  const { rows, loading, create, update, remove } = useIdbTable<Seedling>(db.seedlings, { sortByUpdatedAt: false });
+  const { rows, loading, create, update } = useIdbTable<Seedling>(db.seedlings, { sortByUpdatedAt: false });
 
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Seedling | null>(null);
@@ -132,9 +132,11 @@ export default function SeedlingBoard() {
 
   const handleDelete = async (row: Seedling): Promise<void> => {
     const bound = plantings.filter((item) => item.seedlingId === row.id).length;
-    await remove(row.id);
+    await removeSeedling(row.id);
     message.success(
-      bound > 0 ? `已删除批次（同时清理了 ${bound} 条引用它的栽植记录）` : '已删除苗木批次',
+      bound > 0
+        ? `已删除批次（同时清理了 ${bound} 条引用它的栽植记录，相关验收已标记待复核）`
+        : '已删除苗木批次',
     );
   };
 

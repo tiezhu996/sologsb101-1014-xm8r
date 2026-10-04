@@ -2,6 +2,8 @@
  * 演示数据播种（幂等）
  * 父 → 子 → 孙三层链路：地块 → 苗木批次 / 栽植 → 验收 → 补植
  * 所有 id 固定，保证 /plots/:id/seedlings、/plots/:id/plantings 深链一定命中真实数据。
+ * 验收固定保存当次栽植株数快照；补植计划记录来源验收与当时缺株；
+ * 地块缺株数 = 有效待补植计划缺株之和，播种时即逐株对账自洽。
  */
 import { db, ROW_REVISION } from './db';
 import type { Plot } from '../types/plot';
@@ -32,13 +34,36 @@ function plantingRow(row: Omit<Planting, 'createdAt' | 'updatedAt' | 'revision'>
   return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
 }
 
-function surveyRow(row: Omit<Survey, 'createdAt' | 'updatedAt' | 'revision' | 'grade' | 'gradeManual' | 'survivalRate'>, total: number): Survey {
+function surveyRow(
+  row: Omit<
+    Survey,
+    | 'createdAt'
+    | 'updatedAt'
+    | 'revision'
+    | 'grade'
+    | 'gradeManual'
+    | 'survivalRate'
+    | 'plantedCount'
+    | 'validity'
+    | 'invalidReason'
+    | 'invalidatedAt'
+    | 'reviewedAt'
+    | 'reviewDecision'
+  >,
+  total: number,
+): Survey {
   const survivalRate = calcSurvivalRate(row.aliveCount, total);
   return {
     ...row,
+    plantedCount: total,
     survivalRate,
     grade: rateLevel(survivalRate),
     gradeManual: false,
+    validity: 'valid',
+    invalidReason: '',
+    invalidatedAt: '',
+    reviewedAt: '',
+    reviewDecision: null,
     createdAt: SEED_TIME,
     updatedAt: SEED_TIME,
     revision: ROW_REVISION,
@@ -58,6 +83,7 @@ export async function seedDatabase(): Promise<void> {
   if (exists > 0) return;
 
   // ---------------- 地块（3 块，覆盖三种潮位带与三种底质） ----------------
+  // 缺株数与下方补植计划逐株对账：仅「待补植且来源有效」的计划计入。
   const plots: Plot[] = [
     plotRow({
       id: SEED_IDS.plotA,
@@ -89,7 +115,7 @@ export async function seedDatabase(): Promise<void> {
       substrate: '砂质',
       restoreMode: '造林',
       state: '已验收',
-      missingCount: 560,
+      missingCount: 0,
       lastReplantDate: '2024-11-08',
     }),
   ];
@@ -114,7 +140,7 @@ export async function seedDatabase(): Promise<void> {
     plantingRow({ id: 'planting-c2', plotId: SEED_IDS.plotC, seedlingId: 'seedling-c2', plantDate: '2024-03-24', spacingM: 1.2, count: 3800, operator: '北屿二班' }),
   ];
 
-  // 各地块栽植总株数，用于派生成活率
+  // 各地块栽植总株数：每次验收固定保存为当次株数快照
   const totalByPlot: Record<string, number> = {
     [SEED_IDS.plotA]: 5200,
     [SEED_IDS.plotB]: 3300,
@@ -133,10 +159,44 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   // ---------------- 补植计划（每地块 1 条，覆盖三种状态） ----------------
+  // 记录来源验收与当时缺株；已完成计划保留留痕，不再计入地块缺株数。
   const replants: Replant[] = [
-    replantRow({ id: 'replant-a1', plotId: SEED_IDS.plotA, missingCount: 1092, planDate: '2025-04-10', species: '秋茄', state: '待补植' }),
-    replantRow({ id: 'replant-b1', plotId: SEED_IDS.plotB, missingCount: 1188, planDate: '2025-04-18', species: '白骨壤', state: '已补植' }),
-    replantRow({ id: 'replant-c1', plotId: SEED_IDS.plotC, missingCount: 560, planDate: '2024-11-05', species: '无瓣海桑', state: '已复核' }),
+    replantRow({
+      id: 'replant-a1',
+      plotId: SEED_IDS.plotA,
+      missingCount: 1092,
+      sourceSurveyId: 'survey-a3',
+      sourceMissingCount: 1092,
+      planDate: '2025-04-10',
+      species: '秋茄',
+      state: '待补植',
+      replantedCount: 0,
+      completedDate: '',
+    }),
+    replantRow({
+      id: 'replant-b1',
+      plotId: SEED_IDS.plotB,
+      missingCount: 1188,
+      sourceSurveyId: 'survey-b2',
+      sourceMissingCount: 1188,
+      planDate: '2025-04-18',
+      species: '白骨壤',
+      state: '已补植',
+      replantedCount: 1188,
+      completedDate: '2025-04-20',
+    }),
+    replantRow({
+      id: 'replant-c1',
+      plotId: SEED_IDS.plotC,
+      missingCount: 320,
+      sourceSurveyId: 'survey-c1',
+      sourceMissingCount: 320,
+      planDate: '2024-11-05',
+      species: '无瓣海桑',
+      state: '已复核',
+      replantedCount: 320,
+      completedDate: '2024-11-08',
+    }),
   ];
 
   await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {

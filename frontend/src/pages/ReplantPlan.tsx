@@ -18,6 +18,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
   Upload,
 } from 'antd';
@@ -31,6 +32,7 @@ import {
   SaveOutlined,
   SyncOutlined,
   UploadOutlined,
+  WarningOutlined,
 } from '@ant-design/icons';
 import dayjs, { type Dayjs } from 'dayjs';
 import EmptyPanel from '../components/common/EmptyPanel';
@@ -40,8 +42,10 @@ import { useIdbTable } from '../hooks/useIdbTable';
 import { usePlotStore } from '../stores/plotStore';
 import { useReplantStore } from '../stores/replantStore';
 import { DB_NAME, DB_SCHEMA_VERSION, db } from '../utils/db';
-import { REPLANT_STATE_OPTIONS, type Replant, type ReplantDraft, type ReplantState } from '../types/replant';
+import { REPLANT_STATE_OPTIONS, isReplantCompleted, type Replant, type ReplantDraft, type ReplantState } from '../types/replant';
+import { SURVEY_VALIDITY_LABEL, type Survey } from '../types/survey';
 import { SEEDLING_SPECIES_OPTIONS, type SeedlingSpecies } from '../types/seedling';
+import { isOpenReplanEffective } from '../utils/reconcile';
 import { exportSnapshotJson, exportSummaryCsvFile, parseSnapshot } from '../utils/export';
 import { percentText } from '../utils/rate';
 
@@ -71,6 +75,7 @@ export default function ReplantPlan() {
   const clearDraft = useReplantStore((state) => state.clearDraft);
   const saveDraft = useReplantStore((state) => state.saveDraft);
   const createReplant = useReplantStore((state) => state.createReplant);
+  const updateReplan = useReplantStore((state) => state.updateReplan);
   const deleteReplant = useReplantStore((state) => state.deleteReplant);
   const advance = useReplantStore((state) => state.advance);
   const batchAdvance = useReplantStore((state) => state.batchAdvance);
@@ -79,15 +84,22 @@ export default function ReplantPlan() {
   const exportAll = useReplantStore((state) => state.exportAll);
   const importAll = useReplantStore((state) => state.importAll);
   const resetAll = useReplantStore((state) => state.resetAll);
+  const retryPendingWrites = useReplantStore((state) => state.retryPendingWrites);
+  const pendingTasks = useReplantStore((state) => state.pendingTasks);
   const lastMessage = useReplantStore((state) => state.lastMessage);
 
-  const { rows, loading, update } = useIdbTable<Replant>(db.replants, { sortByUpdatedAt: false });
+  const { rows, loading } = useIdbTable<Replant>(db.replants, { sortByUpdatedAt: false });
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Replant | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [form] = Form.useForm<ReplantFormValues>();
 
   const plotName = (plotId: string): string => plots.find((item) => item.id === plotId)?.name ?? '（地块已删除）';
+  const surveysById = useMemo(() => new Map(surveys.map((row) => [row.id, row])), [surveys]);
+  const isEffective = (row: Replant): boolean => isOpenReplanEffective(row, surveysById);
+  const sourceSurvey = (row: Replant): Survey | undefined =>
+    row.sourceSurveyId === '' ? undefined : surveysById.get(row.sourceSurveyId);
 
   const filtered = useMemo(() => {
     const key = filters.keyword.trim().toLowerCase();
@@ -95,24 +107,32 @@ export default function ReplantPlan() {
       .filter((row) => {
         if (filters.plotId !== 'all' && row.plotId !== filters.plotId) return false;
         if (filters.state !== 'all' && row.state !== filters.state) return false;
+        if (filters.scope === 'effective' && !isOpenReplanEffective(row, surveysById)) return false;
+        if (filters.scope === 'exited' && isOpenReplanEffective(row, surveysById)) return false;
         if (key === '') return true;
         return plotName(row.plotId).toLowerCase().includes(key) || row.species.toLowerCase().includes(key);
       })
       .sort((a, b) => a.planDate.localeCompare(b.planDate));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rows, filters, plots]);
+  }, [rows, filters, plots, surveysById]);
 
   const stats = useMemo(() => {
-    const missing = rows.reduce((acc, row) => acc + row.missingCount, 0);
+    const effectiveRows = rows.filter((row) => isOpenReplanEffective(row, surveysById));
+    const missing = effectiveRows.reduce((acc, row) => acc + row.missingCount, 0);
+    const completed = rows.filter((row) => isReplantCompleted(row.state));
     const reviewed = rows.filter((row) => row.state === '已复核').length;
-    const pending = rows.filter((row) => row.state === '待补植').length;
+    const pending = effectiveRows.length;
+    const exited = rows.length - effectiveRows.length;
     return {
       missing,
       pending,
       reviewed,
+      exited,
+      completedCount: completed.length,
+      completedPlants: completed.reduce((acc, row) => acc + Math.max(row.replantedCount, row.missingCount), 0),
       reviewPct: rows.length === 0 ? 0 : Math.round((reviewed / rows.length) * 1000) / 10,
     };
-  }, [rows]);
+  }, [rows, surveysById]);
 
   const openCreate = (): void => {
     setEditing(null);
@@ -155,8 +175,8 @@ export default function ReplantPlan() {
         await createReplant(payload);
         message.success(`已创建补植计划：缺株 ${payload.missingCount} 株`);
       } else {
-        await update(editing.id, payload);
-        message.success('补植计划已更新');
+        await updateReplan(editing.id, payload);
+        message.success('补植计划已更新，地块缺株数已重新对账');
       }
       setOpen(false);
     } catch (error) {
@@ -198,8 +218,19 @@ export default function ReplantPlan() {
     message.success(`导入成功：${result.message}`);
   };
 
-  const handleReset = (): void => {
-    modal.confirm({
+  const handleRetry = async (): Promise<void> => {
+    setRetrying(true);
+    try {
+      const count = await retryPendingWrites();
+      message.success(count > 0 ? `已继续重试 ${count} 项关联写入` : '补偿队列已清空，缺株数已逐株对账');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '关联写入重试失败');
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  const handleReset = (): void => {    modal.confirm({
       title: '确认重置本地数据？',
       content: '全部地块、苗木批次、栽植记录、验收记录与补植计划都会被清空，并重新灌入演示数据。',
       okText: '确认重置',
@@ -230,22 +261,80 @@ export default function ReplantPlan() {
       ),
     },
     {
+      title: '来源测次 / 当时缺株',
+      key: 'source',
+      width: 220,
+      render: (_value, record) => {
+        const source = sourceSurvey(record);
+        if (record.sourceSurveyId === '') {
+          return (
+            <Space direction="vertical" size={0}>
+              <Tag>手工计划</Tag>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                无来源测次，完成前始终计入缺株
+              </Typography.Text>
+            </Space>
+          );
+        }
+        if (source === undefined) {
+          return (
+            <Tooltip title="来源测次已被删除">
+              <Space direction="vertical" size={0}>
+                <Tag color="default">来源已删除</Tag>
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  当时缺株 {record.sourceMissingCount.toLocaleString('zh-CN')} 株 · 已退出有效范围
+                </Typography.Text>
+              </Space>
+            </Tooltip>
+          );
+        }
+        return (
+          <Tooltip title={source.validity === 'valid' ? '来源测次有效' : source.invalidReason}>
+            <Space direction="vertical" size={0}>
+              <Space size={4}>
+                <Tag color="blue">第 {source.round} 测次</Tag>
+                <Tag color={source.validity === 'valid' ? 'green' : source.validity === 'invalid' ? 'volcano' : 'gold'}>
+                  {SURVEY_VALIDITY_LABEL[source.validity]}
+                </Tag>
+              </Space>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                当时缺株 {record.sourceMissingCount.toLocaleString('zh-CN')} 株
+              </Typography.Text>
+            </Space>
+          </Tooltip>
+        );
+      },
+    },
+    {
       title: '缺株数（株）',
       key: 'missingCount',
-      width: 190,
+      width: 180,
       render: (_value, record) => {
         const draft = drafts[record.id];
-        if (draft === undefined) return record.missingCount.toLocaleString('zh-CN');
+        const node =
+          draft === undefined ? (
+            record.missingCount.toLocaleString('zh-CN')
+          ) : (
+            <InputNumber
+              min={0}
+              max={200000}
+              step={10}
+              size="small"
+              style={{ width: 130 }}
+              value={draft.missingCount ?? record.missingCount}
+              onChange={(value) => setDraft(record.id, { missingCount: value ?? 0 })}
+            />
+          );
         return (
-          <InputNumber
-            min={0}
-            max={200000}
-            step={10}
-            size="small"
-            style={{ width: 130 }}
-            value={draft.missingCount ?? record.missingCount}
-            onChange={(value) => setDraft(record.id, { missingCount: value ?? 0 })}
-          />
+          <Space direction="vertical" size={0}>
+            {node}
+            {isReplantCompleted(record.state) ? (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                实际补植 {Math.max(record.replantedCount, record.missingCount).toLocaleString('zh-CN')} 株
+                {record.completedDate !== '' ? ` · ${record.completedDate}` : ''}
+              </Typography.Text>
+            ) : null}
+          </Space>
         );
       },
     },
@@ -289,9 +378,24 @@ export default function ReplantPlan() {
       title: '状态',
       dataIndex: 'state',
       key: 'state',
-      width: 110,
-      render: (value: ReplantState) => (
-        <Tag color={value === '待补植' ? 'orange' : value === '已补植' ? 'blue' : 'green'}>{value}</Tag>
+      width: 150,
+      render: (value: ReplantState, record) => (
+        <Space direction="vertical" size={2}>
+          <Tag color={value === '待补植' ? 'orange' : value === '已补植' ? 'blue' : 'green'}>{value}</Tag>
+          {isEffective(record) ? (
+            <Tag color="geekblue">计入缺株</Tag>
+          ) : (
+            <Tooltip
+              title={
+                isReplantCompleted(record.state)
+                  ? '已完成计划保留留痕，不再计入地块缺株数'
+                  : sourceSurvey(record)?.invalidReason ?? '来源测次已失效或删除，待来源复核后重新计入'
+              }
+            >
+              <Tag color="default">已退出有效范围</Tag>
+            </Tooltip>
+          )}
+        </Space>
       ),
     },
     {
@@ -371,14 +475,33 @@ export default function ReplantPlan() {
     <div>
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 14 }}>
         <StatBadge label="补植计划" value={rows.length} suffix="条" tone="primary" />
-        <StatBadge label="待补植" value={stats.pending} suffix="条" tone={stats.pending > 0 ? 'warning' : 'default'} />
-        <StatBadge label="缺株合计" value={stats.missing.toLocaleString('zh-CN')} suffix="株" tone="danger" />
+        <StatBadge label="有效待补植" value={stats.pending} suffix="条" tone={stats.pending > 0 ? 'warning' : 'default'} />
+        <StatBadge
+          label="有效缺株合计"
+          value={stats.missing.toLocaleString('zh-CN')}
+          suffix="株"
+          tone="danger"
+          hint="与地块缺株数逐株对账：有效待补植计划缺株之和"
+        />
+        <StatBadge
+          label="已完成补植"
+          value={stats.completedPlants.toLocaleString('zh-CN')}
+          suffix={`株 / ${stats.completedCount} 条`}
+          tone="info"
+          hint="已补植 / 已复核计划保留留痕，不再计入缺株"
+        />
         <StatBadge
           label="复核完成率"
           value={percentText(stats.reviewPct)}
           percent={stats.reviewPct}
           tone="success"
           hint="状态为「已复核」的计划占比"
+        />
+        <StatBadge
+          label="已退出有效范围"
+          value={stats.exited}
+          suffix="条"
+          tone={stats.exited > 0 ? 'warning' : 'default'}
         />
         <StatBadge
           label="数据结构版本"
@@ -389,6 +512,29 @@ export default function ReplantPlan() {
         />
       </div>
 
+      {pendingTasks.length > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          icon={<WarningOutlined />}
+          style={{ marginBottom: 14 }}
+          message={`有 ${pendingTasks.length} 项关联写入待重试（验收失效 / 缺株对账）`}
+          description={
+            <Space direction="vertical" size={2}>
+              {pendingTasks.slice(0, 3).map((task) => (
+                <Typography.Text key={task.id} style={{ fontSize: 12 }} type="secondary">
+                  {plotName(task.plotId) || '全部地块'}：{String(task.payload.reason ?? task.type)}
+                  {task.attempts > 0 ? ` · 已失败 ${task.attempts} 次（${task.lastError || '退避等待中'}）` : ''}
+                </Typography.Text>
+              ))}
+              <Button size="small" type="primary" ghost loading={retrying} icon={<SyncOutlined />} onClick={() => void handleRetry()}>
+                继续重试并逐株对账
+              </Button>
+            </Space>
+          }
+        />
+      ) : null}
+
       {lastMessage !== '' ? (
         <Alert type="info" showIcon style={{ marginBottom: 14 }} message={lastMessage} />
       ) : null}
@@ -397,6 +543,9 @@ export default function ReplantPlan() {
         title="补植计划与结构版本"
         extra={
           <Space wrap>
+            <Button icon={<SyncOutlined />} loading={retrying} onClick={() => void handleRetry()}>
+              重试关联写入 / 对账
+            </Button>
             <Button icon={<DownloadOutlined />} onClick={() => void handleExport()}>
               导出 JSON 存档
             </Button>
@@ -428,11 +577,13 @@ export default function ReplantPlan() {
           fields={[
             { key: 'plotId', label: '地块', options: plots.map((plot) => plot.id), optionLabels: Object.fromEntries(plots.map((plot) => [plot.id, plot.name])) },
             { key: 'state', label: '状态', options: [...REPLANT_STATE_OPTIONS] },
+            { key: 'scope', label: '有效范围', options: ['effective', 'exited'], optionLabels: { effective: '计入缺株', exited: '已退出 / 已完成' } },
           ]}
-          values={{ plotId: filters.plotId, state: filters.state }}
+          values={{ plotId: filters.plotId, state: filters.state, scope: filters.scope === 'all' ? '' : filters.scope }}
           onChange={(key: string, value: string) => {
             if (key === 'plotId') setFilters({ plotId: value });
             if (key === 'state') setFilters({ state: value as ReplantState | 'all' });
+            if (key === 'scope') setFilters({ scope: (value || 'all') as 'all' | 'effective' | 'exited' });
           }}
           onReset={resetFilters}
           resultText={`命中 ${filtered.length} / ${rows.length} 条`}
