@@ -1,6 +1,9 @@
 /**
  * 导出工具：整库 JSON 存档、地块成活率 CSV、文本复制
  * 全部在浏览器本地完成，不经过任何服务端。
+ *
+ * v3 口径：成活率按每条验收固定保存的 plantedCount 计算；
+ * 待复核 / 待补证测次不参与「最新成活率」；缺株数按有效待补植计划逐株合计。
  */
 import type { DatabaseSnapshot } from './db';
 import { DB_NAME, DB_SCHEMA_VERSION } from './db';
@@ -11,6 +14,7 @@ import type { Seedling } from '../types/seedling';
 import type { Replant } from '../types/replant';
 import { RATE_LEVEL_LABEL } from '../types/survey';
 import { calcSurvivalRate, percentText, round1 } from './rate';
+import { reconcilePlot, latestEffectiveSurvey } from './reconcile';
 import { stampSuffix } from './id';
 
 /** 触发浏览器下载 */
@@ -94,25 +98,31 @@ export function exportSummaryCsv(
     '苗木批次数',
     '进场苗木合计(株)',
     '栽植总株数(株)',
-    '测次数',
-    '最新测次',
+    '验收测次数',
+    '有效测次数',
+    '待复核/待补证',
+    '最新有效测次',
     '最新成活株数',
+    '当次固定株数',
     '最新成活率(%)',
     '判定等级',
     '平均株高(cm)',
-    '缺株数(株)',
-    '补植计划数',
+    '记录缺株数(株)',
+    '对账缺株数(株)',
+    '有效补植计划数',
+    '退出有效范围计划数',
     '最近补植日期',
   ];
   const lines: string[] = [header.map(csvCell).join(',')];
   plots.forEach((plot) => {
     const plotSeedlings = seedlings.filter((row) => row.plotId === plot.id);
-    const plotPlantings = plantings.filter((row) => row.plotId === plot.id);
     const plotSurveys = surveys.filter((row) => row.plotId === plot.id).sort((a, b) => a.round - b.round);
-    const plotReplants = replants.filter((row) => row.plotId === plot.id);
-    const total = plotPlantings.reduce((acc, row) => acc + row.count, 0);
-    const latest = plotSurveys.length > 0 ? plotSurveys[plotSurveys.length - 1] : null;
-    const rate = latest ? calcSurvivalRate(latest.aliveCount, total) : 0;
+    const view = reconcilePlot(plot.id, surveys, plantings, replants);
+    const latest = latestEffectiveSurvey(plotSurveys, plot.id);
+    const rate = latest !== null && latest.plantedCount !== null ? calcSurvivalRate(latest.aliveCount, latest.plantedCount) : 0;
+    const pendingStatus = `${plotSurveys.filter((row) => row.validity === 'stale').length}/${
+      plotSurveys.filter((row) => row.validity === 'unproven').length
+    }`;
     lines.push(
       [
         plot.name,
@@ -123,22 +133,27 @@ export function exportSummaryCsv(
         plot.state,
         plotSeedlings.length,
         plotSeedlings.reduce((acc, row) => acc + row.quantity, 0),
-        total,
+        view.plantedTotal,
         plotSurveys.length,
-        latest ? `第 ${latest.round} 测次` : '未验收',
+        view.effectiveSurveyCount,
+        pendingStatus,
+        latest ? `第 ${latest.round} 测次` : '无有效测次',
         latest ? latest.aliveCount : 0,
-        round1(rate),
+        latest?.plantedCount ?? '',
+        latest ? round1(rate) : '',
         latest ? RATE_LEVEL_LABEL[latest.grade] : '—',
         latest ? latest.avgHeightCm : 0,
         plot.missingCount,
-        plotReplants.length,
+        view.missingCount,
+        view.effectiveReplants.length,
+        view.droppedReplants.length,
         plot.lastReplantDate || '—',
       ]
         .map(csvCell)
         .join(','),
     );
   });
-  return `\uFEFF${lines.join('\n')}`;
+  return `﻿${lines.join('\n')}`;
 }
 
 /** 导出成活率汇总 CSV 文件 */
@@ -176,15 +191,21 @@ export function buildSummaryText(
 ): string {
   const lines: string[] = [`【红树林修复成活率通报】共 ${plots.length} 个地块`];
   plots.forEach((plot) => {
-    const total = plantings.filter((row) => row.plotId === plot.id).reduce((acc, row) => acc + row.count, 0);
     const plotSurveys = surveys.filter((row) => row.plotId === plot.id).sort((a, b) => a.round - b.round);
-    const latest = plotSurveys.length > 0 ? plotSurveys[plotSurveys.length - 1] : null;
-    const rate = latest ? calcSurvivalRate(latest.aliveCount, total) : 0;
-    const pending = replants.filter((row) => row.plotId === plot.id && row.state !== '已复核').length;
+    const latest = latestEffectiveSurvey(plotSurveys, plot.id);
+    const view = reconcilePlot(plot.id, surveys, plantings, replants);
+    const rate =
+      latest !== null && latest.plantedCount !== null
+        ? calcSurvivalRate(latest.aliveCount, latest.plantedCount)
+        : 0;
+    const pending = view.effectiveReplants.filter((row) => row.state === '待补植').length;
+    const stale = plotSurveys.filter((row) => row.validity !== 'effective').length;
     lines.push(
-      `· ${plot.name}（${plot.tideZone}潮位带 / ${plot.substrate}）栽植 ${total} 株，最新成活率 ${
-        latest ? percentText(rate) : '未验收'
-      }，缺株 ${plot.missingCount} 株，待办补植 ${pending} 条`,
+      `· ${plot.name}：栽植 ${view.plantedTotal} 株，最新有效成活率 ${
+        latest ? percentText(rate) : '无有效测次'
+      }，记录缺株 ${plot.missingCount} 株（对账 ${view.missingCount} 株），有效待办补植 ${pending} 条${
+        stale > 0 ? `，${stale} 个测次待复核/补证` : ''
+      }`,
     );
   });
   return lines.join('\n');

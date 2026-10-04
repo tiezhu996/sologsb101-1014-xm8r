@@ -30,7 +30,8 @@ import FilterBar from '../components/common/FilterBar';
 import StatBadge from '../components/common/StatBadge';
 import { useIdbTable } from '../hooks/useIdbTable';
 import { usePlotStore } from '../stores/plotStore';
-import { db } from '../utils/db';
+import { db, putPlanting, removePlanting, ROW_REVISION } from '../utils/db';
+import { nowIso, uuid } from '../utils/id';
 import type { Planting } from '../types/planting';
 import type { Seedling } from '../types/seedling';
 import { ROUTES } from '../router';
@@ -64,9 +65,10 @@ export default function PlantingEntry() {
   const { message } = App.useApp();
   const ready = usePlotStore((state) => state.ready);
   const plot = usePlotStore((state) => state.plots.find((item) => item.id === id));
+  const summaryOf = usePlotStore((state) => state.summaryOf);
 
   const seedlingTable = useIdbTable<Seedling>(db.seedlings, { sortByUpdatedAt: false });
-  const { rows, loading, create, update, remove } = useIdbTable<Planting>(db.plantings, { sortByUpdatedAt: false });
+  const { rows, loading } = useIdbTable<Planting>(db.plantings, { sortByUpdatedAt: false });
 
   const [keyword, setKeyword] = useState('');
   const [operatorFilter, setOperatorFilter] = useState('all');
@@ -111,6 +113,7 @@ export default function PlantingEntry() {
       ? 0
       : Math.round((plotPlantings.reduce((acc, row) => acc + row.spacingM, 0) / plotPlantings.length) * 100) / 100;
   const usedSeedlingIds = new Set(plotPlantings.map((row) => row.seedlingId));
+  const reviewSummary = id ? summaryOf(id) : null;
 
   const seedlingLabel = (seedlingId: string): string => {
     const seedling = seedlingTable.rows.find((row) => row.id === seedlingId);
@@ -161,10 +164,17 @@ export default function PlantingEntry() {
         operator: values.operator.trim(),
       };
       if (editing === null) {
-        await create(payload, 'planting');
+        const stamp = nowIso();
+        await putPlanting({
+          id: uuid('planting'),
+          ...payload,
+          createdAt: stamp,
+          updatedAt: stamp,
+          revision: ROW_REVISION,
+        });
         message.success(`已登记栽植 ${payload.count} 株`);
       } else {
-        await update(editing.id, payload);
+        await putPlanting({ ...editing, ...payload });
         message.success('栽植记录已更新');
       }
       const check = plot === undefined ? null : checkDensity(plot.areaMu, payload.spacingM, payload.count);
@@ -273,8 +283,8 @@ export default function PlantingEntry() {
             okButtonProps={{ danger: true }}
             cancelText="取消"
             onConfirm={async () => {
-              await remove(record.id);
-              message.success('栽植记录已删除');
+              await removePlanting(record.id);
+              message.success('栽植记录已删除，相关验收已转入待复核');
             }}
           >
             <Button size="small" type="link" danger icon={<DeleteOutlined />}>
@@ -324,6 +334,23 @@ export default function PlantingEntry() {
           action={
             <Button size="small" onClick={() => navigate(ROUTES.seedlings(plot.id))}>
               去登记苗木批次
+            </Button>
+          }
+        />
+      ) : null}
+
+      {reviewSummary !== null && (reviewSummary.staleCount > 0 || reviewSummary.unprovenCount > 0) ? (
+        <Alert
+          type={reviewSummary.staleCount > 0 ? 'warning' : 'info'}
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`有 ${reviewSummary.staleCount} 个测次待复核${
+            reviewSummary.unprovenCount > 0 ? `、${reviewSummary.unprovenCount} 个测次待补证` : ''
+          }`}
+          description="补录或修订栽植记录后，早先验收不会自动改动，而是固定保留当次栽植株数并转入待复核；请到成活率验收台逐测次决定保留原测次或按新株数重算。"
+          action={
+            <Button size="small" onClick={() => navigate(ROUTES.surveys)}>
+              去验收台复核
             </Button>
           }
         />

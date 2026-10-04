@@ -79,12 +79,12 @@ export default function PlotList() {
 
   const totals = useMemo(() => {
     const plantTotal = plots.reduce((acc, plot) => acc + statOf(plot.id).plantTotal, 0);
-    const rated = plots.filter((plot) => statOf(plot.id).surveyCount > 0);
+    const rated = plots.filter((plot) => statOf(plot.id).effectiveSurveyCount > 0);
     const avgRate =
       rated.length === 0
         ? 0
         : Math.round((rated.reduce((acc, plot) => acc + statOf(plot.id).latestRate, 0) / rated.length) * 10) / 10;
-    const warnCount = plots.filter((plot) => statOf(plot.id).surveyCount > 0 && statOf(plot.id).latestRate < 70).length;
+    const warnCount = plots.filter((plot) => statOf(plot.id).effectiveSurveyCount > 0 && statOf(plot.id).latestRate < 70).length;
     return { plantTotal, avgRate, warnCount };
   }, [plots, statOf]);
 
@@ -203,9 +203,22 @@ export default function PlotList() {
     {
       title: '验收测次',
       key: 'surveyCount',
-      width: 96,
+      width: 110,
       align: 'right',
-      render: (_value, record) => `${statOf(record.id).surveyCount} 次`,
+      render: (_value, record) => {
+        const stat = statOf(record.id);
+        const pending = stat.staleCount + stat.unprovenCount;
+        return (
+          <Space direction="vertical" size={0} style={{ textAlign: 'right' }}>
+            <span>{stat.surveyCount} 次</span>
+            {pending > 0 ? (
+              <Typography.Text type="warning" style={{ fontSize: 12 }}>
+                {stat.staleCount} 待复核{stat.unprovenCount > 0 ? `/${stat.unprovenCount} 待补证` : ''}
+              </Typography.Text>
+            ) : null}
+          </Space>
+        );
+      },
     },
     {
       title: '最新成活率',
@@ -213,10 +226,13 @@ export default function PlotList() {
       width: 190,
       render: (_value, record) => {
         const stat = statOf(record.id);
+        if (stat.effectiveSurveyCount === 0) {
+          return <Tag>{stat.surveyCount > 0 ? '无有效测次' : '尚未验收'}</Tag>;
+        }
         return (
           <Space size={6} wrap>
-            <RateTag rate={stat.surveyCount > 0 ? stat.latestRate : null} level={stat.level} />
-            {stat.surveyCount > 0 && stat.trend !== 0 ? (
+            <RateTag rate={stat.latestRate} level={stat.level} />
+            {stat.trend !== 0 ? (
               <Typography.Text type={stat.trend > 0 ? 'success' : 'danger'} style={{ fontSize: 12 }}>
                 {stat.trend > 0 ? <RiseOutlined /> : <FallOutlined />} {Math.abs(stat.trend)}
               </Typography.Text>
@@ -227,13 +243,24 @@ export default function PlotList() {
     },
     {
       title: '缺株数',
-      dataIndex: 'missingCount',
       key: 'missingCount',
-      width: 96,
+      width: 120,
       align: 'right',
-      render: (value: number) => (
-        <Typography.Text type={value > 0 ? 'warning' : 'secondary'}>{value} 株</Typography.Text>
-      ),
+      render: (_value, record) => {
+        const stat = statOf(record.id);
+        return (
+          <Space direction="vertical" size={0} style={{ textAlign: 'right' }}>
+            <Typography.Text type={record.missingCount > 0 ? 'warning' : 'secondary'}>
+              {record.missingCount} 株
+            </Typography.Text>
+            {!stat.missingConsistent ? (
+              <Typography.Text type="danger" style={{ fontSize: 12 }}>
+                应对账 {stat.expectedMissing} 株
+              </Typography.Text>
+            ) : null}
+          </Space>
+        );
+      },
     },
     {
       title: '操作',

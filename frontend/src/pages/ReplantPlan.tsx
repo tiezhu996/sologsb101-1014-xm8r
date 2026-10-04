@@ -39,9 +39,10 @@ import StatBadge from '../components/common/StatBadge';
 import { useIdbTable } from '../hooks/useIdbTable';
 import { usePlotStore } from '../stores/plotStore';
 import { useReplantStore } from '../stores/replantStore';
-import { DB_NAME, DB_SCHEMA_VERSION, db } from '../utils/db';
+import { DB_NAME, DB_SCHEMA_VERSION, db, saveReplant } from '../utils/db';
 import { REPLANT_STATE_OPTIONS, type Replant, type ReplantDraft, type ReplantState } from '../types/replant';
 import { SEEDLING_SPECIES_OPTIONS, type SeedlingSpecies } from '../types/seedling';
+import { SURVEY_VALIDITY_LABEL, type Survey } from '../types/survey';
 import { exportSnapshotJson, exportSummaryCsvFile, parseSnapshot } from '../utils/export';
 import { percentText } from '../utils/rate';
 
@@ -61,6 +62,8 @@ export default function ReplantPlan() {
   const surveys = usePlotStore((state) => state.surveys);
   const statOf = usePlotStore((state) => state.statOf);
   const ready = usePlotStore((state) => state.ready);
+  const pendingWrites = usePlotStore((state) => state.pendingWrites);
+  const retryPendingWrites = usePlotStore((state) => state.retryPendingWrites);
 
   const filters = useReplantStore((state) => state.filters);
   const setFilters = useReplantStore((state) => state.setFilters);
@@ -81,13 +84,27 @@ export default function ReplantPlan() {
   const resetAll = useReplantStore((state) => state.resetAll);
   const lastMessage = useReplantStore((state) => state.lastMessage);
 
-  const { rows, loading, update } = useIdbTable<Replant>(db.replants, { sortByUpdatedAt: false });
+  const { rows, loading } = useIdbTable<Replant>(db.replants, { sortByUpdatedAt: false });
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Replant | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [form] = Form.useForm<ReplantFormValues>();
 
   const plotName = (plotId: string): string => plots.find((item) => item.id === plotId)?.name ?? '（地块已删除）';
+
+  /** 来源测次查找；来源失效 / 已删除时返回 null */
+  const sourceSurveyOf = (row: Replant): Survey | null => {
+    if (row.sourceSurveyId === '') return null;
+    return surveys.find((item) => item.id === row.sourceSurveyId) ?? null;
+  };
+
+  /** 未完成计划是否因来源测次失效而退出有效范围（已完成计划始终保留） */
+  const isDropped = (row: Replant): boolean => {
+    if (row.state !== '待补植') return false;
+    if (row.sourceSurveyId === '') return false;
+    const source = sourceSurveyOf(row);
+    return source === null || source.validity !== 'effective';
+  };
 
   const filtered = useMemo(() => {
     const key = filters.keyword.trim().toLowerCase();
@@ -103,16 +120,38 @@ export default function ReplantPlan() {
   }, [rows, filters, plots]);
 
   const stats = useMemo(() => {
-    const missing = rows.reduce((acc, row) => acc + row.missingCount, 0);
+    // 缺株合计只统计有效范围内的计划：来源失效的未完成计划已退出，不计缺株
+    const effective = rows.filter((row) => {
+      if (row.state !== '待补植' || row.sourceSurveyId === '') return true;
+      const source = surveys.find((item) => item.id === row.sourceSurveyId);
+      return source !== undefined && source.validity === 'effective';
+    });
+    const missing = effective
+      .filter((row) => row.state === '待补植')
+      .reduce((acc, row) => acc + row.missingCount, 0);
     const reviewed = rows.filter((row) => row.state === '已复核').length;
-    const pending = rows.filter((row) => row.state === '待补植').length;
+    const pending = effective.filter((row) => row.state === '待补植').length;
+    const dropped = rows.length - effective.length;
     return {
       missing,
       pending,
       reviewed,
+      dropped,
       reviewPct: rows.length === 0 ? 0 : Math.round((reviewed / rows.length) * 1000) / 10,
     };
-  }, [rows]);
+  }, [rows, surveys]);
+
+  const inconsistentPlots = useMemo(
+    () => plots.filter((plot) => !statOf(plot.id).missingConsistent),
+    [plots, statOf],
+  );
+
+  const handleRetryWrites = async (): Promise<void> => {
+    const result = await retryPendingWrites();
+    if (result.applied > 0) message.success(`已补写 ${result.applied} 个地块的缺株数对账`);
+    if (result.failed > 0) message.error(`仍有 ${result.failed} 个地块关联写入失败，可稍后继续重试`);
+    if (result.applied === 0 && result.failed === 0) message.info('没有待处理的关联写入');
+  };
 
   const openCreate = (): void => {
     setEditing(null);
@@ -155,7 +194,7 @@ export default function ReplantPlan() {
         await createReplant(payload);
         message.success(`已创建补植计划：缺株 ${payload.missingCount} 株`);
       } else {
-        await update(editing.id, payload);
+        await saveReplant({ ...editing, ...payload });
         message.success('补植计划已更新');
       }
       setOpen(false);
@@ -218,34 +257,77 @@ export default function ReplantPlan() {
       title: '地块',
       key: 'plot',
       width: 200,
-      render: (_value, record) => (
-        <Space direction="vertical" size={0}>
-          <span>{plotName(record.plotId)}</span>
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            最新成活率{' '}
-            {statOf(record.plotId).surveyCount > 0 ? percentText(statOf(record.plotId).latestRate) : '未验收'} ·
-            栽植 {statOf(record.plotId).plantTotal.toLocaleString('zh-CN')} 株
-          </Typography.Text>
-        </Space>
-      ),
+      render: (_value, record) => {
+        const stat = statOf(record.plotId);
+        const plot = plots.find((item) => item.id === record.plotId);
+        return (
+          <Space direction="vertical" size={0}>
+            <span>{plotName(record.plotId)}</span>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              最新有效成活率 {stat.effectiveSurveyCount > 0 ? percentText(stat.latestRate) : '无有效测次'} · 栽植{' '}
+              {stat.plantTotal.toLocaleString('zh-CN')} 株
+            </Typography.Text>
+            <Typography.Text type={stat.missingConsistent ? 'secondary' : 'danger'} style={{ fontSize: 12 }}>
+              地块缺株 {plot?.missingCount ?? 0} 株{stat.missingConsistent ? '' : `（应对账 ${stat.expectedMissing} 株）`}
+            </Typography.Text>
+          </Space>
+        );
+      },
     },
     {
       title: '缺株数（株）',
       key: 'missingCount',
       width: 190,
       render: (_value, record) => {
+        const dropped = isDropped(record);
         const draft = drafts[record.id];
-        if (draft === undefined) return record.missingCount.toLocaleString('zh-CN');
         return (
-          <InputNumber
-            min={0}
-            max={200000}
-            step={10}
-            size="small"
-            style={{ width: 130 }}
-            value={draft.missingCount ?? record.missingCount}
-            onChange={(value) => setDraft(record.id, { missingCount: value ?? 0 })}
-          />
+          <Space direction="vertical" size={0}>
+            {draft === undefined ? (
+              <span style={dropped ? { textDecoration: 'line-through', color: '#b0aaa0' } : undefined}>
+                {record.missingCount.toLocaleString('zh-CN')}
+              </span>
+            ) : (
+              <InputNumber
+                min={0}
+                max={200000}
+                step={10}
+                size="small"
+                style={{ width: 130 }}
+                value={draft.missingCount ?? record.missingCount}
+                onChange={(value) => setDraft(record.id, { missingCount: value ?? 0 })}
+              />
+            )}
+            {dropped ? <Tag color="red">来源失效，退出有效范围</Tag> : null}
+          </Space>
+        );
+      },
+    },
+    {
+      title: '来源测次 / 当时缺株',
+      key: 'source',
+      width: 190,
+      render: (_value, record) => {
+        const source = sourceSurveyOf(record);
+        if (source === null) {
+          return (
+            <Space direction="vertical" size={0}>
+              <Tag>手工计划</Tag>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                当时缺株 {record.sourceMissingCount.toLocaleString('zh-CN')} 株
+              </Typography.Text>
+            </Space>
+          );
+        }
+        return (
+          <Space direction="vertical" size={0}>
+            <Tag color={source.validity === 'effective' ? 'blue' : 'orange'}>
+              第 {source.round} 测次 · {SURVEY_VALIDITY_LABEL[source.validity]}
+            </Tag>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              当时缺株 {record.sourceMissingCount.toLocaleString('zh-CN')} 株
+            </Typography.Text>
+          </Space>
         );
       },
     },
@@ -290,8 +372,15 @@ export default function ReplantPlan() {
       dataIndex: 'state',
       key: 'state',
       width: 110,
-      render: (value: ReplantState) => (
-        <Tag color={value === '待补植' ? 'orange' : value === '已补植' ? 'blue' : 'green'}>{value}</Tag>
+      render: (value: ReplantState, record) => (
+        <Space direction="vertical" size={0}>
+          <Tag color={value === '待补植' ? 'orange' : value === '已补植' ? 'blue' : 'green'}>{value}</Tag>
+          {isDropped(record) ? (
+            <Typography.Text type="danger" style={{ fontSize: 11 }}>
+              不计入缺株
+            </Typography.Text>
+          ) : null}
+        </Space>
       ),
     },
     {
@@ -350,6 +439,7 @@ export default function ReplantPlan() {
           </Button>
           <Popconfirm
             title="确认删除该补植计划？"
+          description="删除后地块缺株数会按剩余有效补植计划重新逐株对账。"
             okText="删除"
             okButtonProps={{ danger: true }}
             cancelText="取消"
@@ -371,8 +461,21 @@ export default function ReplantPlan() {
     <div>
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 14 }}>
         <StatBadge label="补植计划" value={rows.length} suffix="条" tone="primary" />
-        <StatBadge label="待补植" value={stats.pending} suffix="条" tone={stats.pending > 0 ? 'warning' : 'default'} />
-        <StatBadge label="缺株合计" value={stats.missing.toLocaleString('zh-CN')} suffix="株" tone="danger" />
+        <StatBadge label="有效待补植" value={stats.pending} suffix="条" tone={stats.pending > 0 ? 'warning' : 'default'} />
+        <StatBadge
+          label="缺株合计（对账）"
+          value={stats.missing.toLocaleString('zh-CN')}
+          suffix="株"
+          tone="danger"
+          hint="有效待补植计划逐株合计；来源测次失效的未完成计划不计入"
+        />
+        <StatBadge
+          label="退出有效范围"
+          value={stats.dropped}
+          suffix="条"
+          tone={stats.dropped > 0 ? 'danger' : 'default'}
+          hint="来源测次已失效（待复核 / 待补证 / 已删除）的未完成计划，已完成计划保留不受影响"
+        />
         <StatBadge
           label="复核完成率"
           value={percentText(stats.reviewPct)}
@@ -388,6 +491,57 @@ export default function ReplantPlan() {
           hint="IndexedDB 库名与结构版本号；升级时会按 version().stores() 自动迁移"
         />
       </div>
+
+      {pendingWrites.length > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`有 ${pendingWrites.length} 个地块的缺株数关联写入尚未落地`}
+          description={
+            <Space direction="vertical" size={4}>
+              {pendingWrites.slice(0, 3).map((item) => (
+                <span key={item.id} style={{ fontSize: 12 }}>
+                  {plotName(item.plotId)}：目标缺株 {item.payload.missingCount} 株 · 已尝试 {item.attempts} 次
+                  {item.lastError !== '' ? ` · ${item.lastError}` : ''}
+                </span>
+              ))}
+            </Space>
+          }
+          action={
+            <Button size="small" type="primary" icon={<SyncOutlined />} onClick={() => void handleRetryWrites()}>
+              重试关联写入
+            </Button>
+          }
+        />
+      ) : null}
+
+      {inconsistentPlots.length > 0 ? (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`${inconsistentPlots.length} 个地块的记录缺株数与有效补植计划不一致`}
+          description={
+            <Space direction="vertical" size={2}>
+              {inconsistentPlots.map((plot) => {
+                const stat = statOf(plot.id);
+                return (
+                  <span key={plot.id} style={{ fontSize: 12 }}>
+                    {plot.name}：记录 {plot.missingCount} 株，应对账 {stat.expectedMissing} 株（差{' '}
+                    {plot.missingCount - stat.expectedMissing} 株）
+                  </span>
+                );
+              })}
+            </Space>
+          }
+          action={
+            <Button size="small" danger icon={<SyncOutlined />} onClick={() => void handleRetryWrites()}>
+              立即逐株对账
+            </Button>
+          }
+        />
+      ) : null}
 
       {lastMessage !== '' ? (
         <Alert type="info" showIcon style={{ marginBottom: 14 }} message={lastMessage} />
@@ -467,7 +621,7 @@ export default function ReplantPlan() {
             loading={loading || !ready}
             columns={columns}
             dataSource={filtered}
-            scroll={{ x: 1400 }}
+            scroll={{ x: 1700 }}
             rowSelection={{
               selectedRowKeys: selectedIds,
               onChange: (keys) => setSelectedIds(keys.map((key) => String(key))),
@@ -515,7 +669,8 @@ export default function ReplantPlan() {
             </Form.Item>
           </Space>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            状态推进到「已补植」时，会自动回写地块缺株数并重算最新一次验收的成活率。
+            由验收生成的计划会固定记录来源测次与当时缺株：来源测次失效时本计划（待补植）退出有效范围；
+            推进到「已补植」后不改写验收测次，而是按有效计划逐株对账回写地块缺株数（失败可重试）。
           </Typography.Text>
         </Form>
       </Modal>

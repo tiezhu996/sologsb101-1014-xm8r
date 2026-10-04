@@ -2,20 +2,27 @@
  * 补植计划状态管理（Zustand）
  * 维护补植计划的行内草稿、复核状态与批量选中项；
  * 状态推进与「补植完成回写地块缺株数」也在这里统一收口。
+ *
+ * v3 规则：
+ * - 计划固定记录来源验收与当时缺株；来源测次失效时未完成计划退出有效范围；
+ * - 已完成计划保留并继续参与对账；
+ * - 地块缺株数回写走关联写入待办队列，任何一步失败都可继续重试。
  */
 import { create } from 'zustand';
 import type { Replant, ReplantDraft, ReplantState } from '../types/replant';
 import {
   advanceReplantState,
   db,
+  drainPendingWrites,
   exportSnapshot,
   importSnapshot,
   initDatabase,
-  putReplant,
   removeReplant,
   resetDatabase,
+  saveReplant,
   type DatabaseSnapshot,
 } from '../utils/db';
+import { ROW_REVISION } from '../utils/db';
 import { nowIso, uuid } from '../utils/id';
 import { usePlotStore } from './plotStore';
 
@@ -44,7 +51,7 @@ export interface ReplantStoreState {
   saveDraft: (replantId: string) => Promise<void>;
   createReplant: (draft: ReplantDraft) => Promise<Replant>;
   deleteReplant: (replantId: string) => Promise<void>;
-  /** 推进到下一状态；进入「已补植」时回写地块缺株数并重算成活率 */
+  /** 推进到下一状态；进入「已补植」时回写地块缺株数（不改写验收测次） */
   advance: (replantId: string) => Promise<ReplantState | null>;
   setState: (replantId: string, state: ReplantState) => Promise<void>;
   batchAdvance: () => Promise<number>;
@@ -98,7 +105,8 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
     if (draft === undefined) return;
     const existing = await db.replants.get(replantId);
     if (!existing) return;
-    await putReplant({ ...existing, ...draft } as Replant);
+    await saveReplant({ ...existing, ...draft } as Replant);
+    await drainPendingWrites();
     get().clearDraft(replantId);
     set({ revision: get().revision + 1, lastMessage: '草稿已保存到补植计划' });
   },
@@ -112,17 +120,22 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
       planDate: draft.planDate,
       species: draft.species,
       state: draft.state,
+      // 手工新建计划无来源测次；当时缺株即计划株数本身
+      sourceSurveyId: '',
+      sourceMissingCount: draft.missingCount,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     };
-    await putReplant(row);
+    await saveReplant(row);
+    await drainPendingWrites();
     set({ revision: get().revision + 1 });
     return row;
   },
 
   async deleteReplant(replantId) {
     await removeReplant(replantId);
+    await drainPendingWrites();
     get().clearDraft(replantId);
     set({
       selectedIds: get().selectedIds.filter((id) => id !== replantId),
@@ -137,16 +150,24 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
     if (index < 0 || index >= FLOW.length - 1) return null;
     const next = FLOW[index + 1];
     await advanceReplantState(replantId, next);
+    // 关联回写立即尝试落地；失败时保留在待办队列，可稍后继续重试
+    const result = await drainPendingWrites();
     await usePlotStore.getState().refreshCounts();
     set({
       revision: get().revision + 1,
-      lastMessage: next === '已补植' ? '已标记补植完成，地块缺株数与成活率已回写' : `状态已推进为「${next}」`,
+      lastMessage:
+        next === '已补植'
+          ? result.failed > 0
+            ? '补植已完成，地块缺株数回写已排队，待下次自动重试或手动重试'
+            : '已标记补植完成，地块缺株数已按有效计划逐株对账回写'
+          : `状态已推进为「${next}」`,
     });
     return next;
   },
 
   async setState(replantId, state) {
     await advanceReplantState(replantId, state);
+    await drainPendingWrites();
     set({ revision: get().revision + 1 });
   },
 

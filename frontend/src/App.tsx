@@ -36,6 +36,7 @@ export default function App() {
   const currentPlotId = usePlotStore((state) => state.currentPlotId);
   const statOf = usePlotStore((state) => state.statOf);
   const error = usePlotStore((state) => state.error);
+  const pendingWrites = usePlotStore((state) => state.pendingWrites);
   const loadAll = usePlotStore((state) => state.loadAll);
   const initSurvey = useSurveyStore((state) => state.init);
   const initReplant = useReplantStore((state) => state.init);
@@ -82,6 +83,14 @@ export default function App() {
           <div>
             <ToolOutlined /> 补植 {counts.replants ?? 0} · 结构 v{String(counts.schemaVersion ?? '-')}
           </div>
+          {pendingWrites.length > 0 ? (
+            <div style={{ color: '#ffb020' }}>
+              ⚠ 关联写入待重试 {pendingWrites.length} ·{' '}
+              <Typography.Link style={{ color: '#ffd591', fontSize: 12 }} onClick={() => navigate(ROUTES.replants)}>
+                去对账
+              </Typography.Link>
+            </div>
+          ) : null}
         </div>
       </Sider>
 
@@ -109,10 +118,22 @@ export default function App() {
                 <Tag>{currentPlot.areaMu} 亩</Tag>
                 <Tag>{currentPlot.tideZone}潮位带 / {currentPlot.substrate}</Tag>
                 <Tag color="blue">栽植 {currentStat.plantTotal.toLocaleString('zh-CN')} 株</Tag>
-                <Tag color={currentStat.surveyCount === 0 ? 'default' : 'green'}>
-                  {currentStat.surveyCount === 0 ? '尚未验收' : `成活率 ${percentText(currentStat.latestRate)}`}
+                <Tag color={currentStat.effectiveSurveyCount === 0 ? 'default' : 'green'}>
+                  {currentStat.effectiveSurveyCount === 0
+                    ? currentStat.surveyCount > 0
+                      ? '无有效测次'
+                      : '尚未验收'
+                    : `成活率 ${percentText(currentStat.latestRate)}`}
                 </Tag>
-                <Tag color={currentPlot.missingCount > 0 ? 'orange' : 'green'}>缺株 {currentPlot.missingCount} 株</Tag>
+                {currentStat.staleCount + currentStat.unprovenCount > 0 ? (
+                  <Tag color="orange">
+                    {currentStat.staleCount} 待复核{currentStat.unprovenCount > 0 ? `/${currentStat.unprovenCount} 待补证` : ''}
+                  </Tag>
+                ) : null}
+                <Tag color={currentPlot.missingCount > 0 ? 'orange' : 'green'}>
+                  缺株 {currentPlot.missingCount} 株
+                  {currentStat.missingConsistent ? '' : `（对账 ${currentStat.expectedMissing}）`}
+                </Tag>
               </>
             ) : (
               <Tag>未选择地块</Tag>

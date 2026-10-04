@@ -42,7 +42,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 构建 | Vite 5 | 开发端口与宿主端口一致（22814） |
 | 路由 | React Router 6 | `createBrowserRouter` + 路由懒加载 |
 | 状态管理 | Zustand 4 | 跨页状态集中在 store，页面只读 store |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbmangrove`，含 v1 → v2 升级迁移 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbmangrove`，含 v1 → v2 → v3 升级迁移 |
 | 时间处理 | dayjs | |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
@@ -100,11 +100,15 @@ sologsb101-1014/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbmangrove`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移：
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移，`version(3)` 固定验收口径并新增关联写入待办表：
   * 为 `plots` 增加 `updatedAt`、`surveys` 增加 `[plotId+round]` 复合索引、`plantings` 增加 `spacingM` 索引等；
   * 回填 `revision` / `createdAt` / `updatedAt`；
   * 为 `plots` 补齐 `missingCount`、`lastReplantDate` 回写字段；
-  * 为 `surveys` 补齐 `grade`、`gradeManual` 字段（按 `survivalRate` 自动判定等级）。
+  * 为 `surveys` 补齐 `grade`、`gradeManual` 字段（按 `survivalRate` 自动判定等级）；
+  * 为 `surveys` 补齐 `plantedCount`（当次固定栽植株数）与 `validity`（`effective` / `stale` / `unproven`）：
+    能用现存栽植总株数严格证明、或由旧成活率唯一反推出整数株数的自动回填，其余留在「待补证」；
+  * 为 `replants` 补齐 `sourceSurveyId`、`sourceMissingCount`（来源验收与当时缺株）；
+  * 新增 `pendingWrites` 表（关联写入待办队列 / outbox）。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -112,8 +116,9 @@ sologsb101-1014/
   | `plots` | id | name, tideZone, substrate, restoreMode, state, createdAt, updatedAt |
   | `seedlings` | id | plotId, species, source, arrivalDate, quantity |
   | `plantings` | id | plotId, seedlingId, plantDate, spacingM |
-  | `surveys` | id | plotId, [plotId+round], date, grade |
-  | `replants` | id | plotId, planDate, state, species |
+  | `surveys` | id | plotId, [plotId+round], date, grade, validity |
+  | `replants` | id | plotId, planDate, state, species, sourceSurveyId |
+  | `pendingWrites` | id | kind, plotId |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `plots` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **地块 → 苗木批次 → 栽植 → 验收 → 补植** 三层互相引用：
@@ -140,6 +145,7 @@ npm run dev          # http://localhost:22814
 ```bash
 npm run build        # tsc --noEmit && vite build（零错误）
 npm run typecheck    # 仅做 TypeScript 类型检查
+npm run verify       # 用 fake-indexeddb 端到端验证失效/复核/对账/重试/升级规则
 npm run preview      # 预览 dist 产物
 ```
 
@@ -147,8 +153,24 @@ npm run preview      # 预览 dist 产物
 
 ## 七、核心业务规则
 
-* **成活率** = 成活株数 ÷ 该地块栽植总株数 × 100%（`src/utils/rate.ts` 统一口径）。
+* **成活率** = 成活株数 ÷ **该测次固定保存的栽植株数** × 100%（`src/utils/rate.ts` 统一口径）。
+  每次验收在保存瞬间把当时的栽植总株数冻结进 `surveys.plantedCount`，此后补录 / 修订栽植记录
+  不会改动历史成活率，避免早先验收随栽植台账漂移。
+* **验收失效与复核**：栽植记录增删改（含删除被引用的苗木批次）后，同地块「冻结株数已与现状不符」的
+  有效验收转入「待复核」（`stale`），在成活率验收台逐测次选择：
+  * **保留原测次**：冻结株数与成活率不变，恢复有效；
+  * **按新株数重算**：以当前栽植总株数更新快照并重算成活率；
+  * **人工补证**：旧数据无法证明原株数时（`unproven` 待补证），凭验收单据补填株数后恢复有效。
+  待复核 / 待补证测次不参与「最新成活率」「告警」与缺株对账。
+* **补植计划来源追溯**：由验收生成的计划固定记录 `sourceSurveyId`（来源测次）与 `sourceMissingCount`
+  （当时缺株）。来源测次失效（待复核 / 待补证 / 被删除）时，**未完成**（待补植）计划退出有效范围、
+  不再占用地块缺株数；**已完成**（已补植 / 已复核）计划始终保留并继续参与对账。
+* **地块缺株逐株对账**：`plots.missingCount` = 该地块「有效待补植计划」缺株数逐株合计
+  （`src/utils/reconcile.ts`）。验收复核、计划增删改与状态推进都会重新对账。
+* **关联写入失败可重试**：缺株数回写先进入 `pendingWrites` 待办队列（outbox，绝对值写入、天然幂等），
+  再落地到 `plots`；任一回落失败保留在队中，可在补植计划页手动重试，也会在应用启动、浏览器
+  重新联网 / 页面重新可见时自动重试，直至地块缺株数与有效计划一致。
 * **成活率等级**：≥ 85% 优，70%–85% 良，50%–70% 一般，< 50% 差；低于 50% 视为告警，建议生成补植计划。
 * **密度合理性**：平均单株占地面积需落在 0.6–12 ㎡/株；过密/过疏都会在栽植记录页给出提示。
-* **补植回写**：补植状态推进到「已补植」时，自动扣减地块缺株数、写入最近补植日期，
-  并按「原成活株数 + 本次补植株数」重算最新一次验收的成活率。
+* **补植完成回写**：状态推进到「已补植」时只回写地块缺株数与最近补植日期，**不再改写任何验收测次**
+  （成活率口径已由各测次冻结株数固定）。

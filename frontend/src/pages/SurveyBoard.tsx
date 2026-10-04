@@ -1,6 +1,7 @@
 /**
  * /surveys 成活率与株高验收台
- * 按测次录入成活株数与平均株高，自动算成活率并低于阈值告警；支持批量调整成活率等级。
+ * 按测次录入成活株数与平均株高，保存时固定当次栽植株数并自动算成活率；
+ * 栽植记录变化后相关验收先失效，复核时决定保留原测次或按新株数重算，旧数据可人工补证。
  * 消费模型：Survey、Plot、Planting；复用组件：<RateTag>、<EmptyPanel>、<StatBadge>
  */
 import { useMemo, useState } from 'react';
@@ -10,6 +11,7 @@ import {
   Button,
   Card,
   DatePicker,
+  Dropdown,
   Form,
   InputNumber,
   Modal,
@@ -29,6 +31,9 @@ import {
   RiseOutlined,
   FallOutlined,
   ToolOutlined,
+  SafetyCertificateOutlined,
+  HistoryOutlined,
+  FileSearchOutlined,
 } from '@ant-design/icons';
 import dayjs, { type Dayjs } from 'dayjs';
 import EmptyPanel from '../components/common/EmptyPanel';
@@ -38,8 +43,15 @@ import { useIdbTable } from '../hooks/useIdbTable';
 import { usePlotStore } from '../stores/plotStore';
 import { useSurveyStore } from '../stores/surveyStore';
 import { db } from '../utils/db';
-import { RATE_LEVEL_LABEL, RATE_LEVEL_OPTIONS, type RateLevel, type Survey } from '../types/survey';
-import { SURVIVAL_WARN_RATE, percentText } from '../utils/rate';
+import {
+  RATE_LEVEL_LABEL,
+  RATE_LEVEL_OPTIONS,
+  SURVEY_VALIDITY_LABEL,
+  type RateLevel,
+  type Survey,
+  type SurveyValidity,
+} from '../types/survey';
+import { SURVIVAL_WARN_RATE, calcSurvivalRate, percentText } from '../utils/rate';
 
 interface SurveyFormValues {
   plotId: string;
@@ -49,12 +61,19 @@ interface SurveyFormValues {
   avgHeightCm: number;
 }
 
+const VALIDITY_COLOR: Record<SurveyValidity, string> = {
+  effective: 'green',
+  stale: 'orange',
+  unproven: 'red',
+};
+
 export default function SurveyBoard() {
   const { message } = App.useApp();
   const plots = usePlotStore((state) => state.plots);
   const ready = usePlotStore((state) => state.ready);
   const statOf = usePlotStore((state) => state.statOf);
   const summaryOf = usePlotStore((state) => state.summaryOf);
+  const plantings = usePlotStore((state) => state.plantings);
   const filters = useSurveyStore((state) => state.filters);
   const setFilters = useSurveyStore((state) => state.setFilters);
   const resetFilters = useSurveyStore((state) => state.resetFilters);
@@ -66,14 +85,18 @@ export default function SurveyBoard() {
   const generateReplant = useSurveyStore((state) => state.generateReplant);
   const createSurvey = useSurveyStore((state) => state.createSurvey);
   const updateSurvey = useSurveyStore((state) => state.updateSurvey);
+  const review = useSurveyStore((state) => state.review);
   const deleteSurvey = useSurveyStore((state) => state.deleteSurvey);
   const surveyRevision = useSurveyStore((state) => state.revision);
 
-  const { rows, loading, remove } = useIdbTable<Survey>(db.surveys, { sortByUpdatedAt: false });
+  const { rows, loading } = useIdbTable<Survey>(db.surveys, { sortByUpdatedAt: false });
 
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Survey | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  /** 待补证弹窗当前测次 */
+  const [proving, setProving] = useState<Survey | null>(null);
+  const [provenCount, setProvenCount] = useState<number | null>(null);
   const [form] = Form.useForm<SurveyFormValues>();
 
   const filtered = useMemo(() => {
@@ -82,6 +105,7 @@ export default function SurveyBoard() {
     return rows
       .filter((row) => {
         if (filters.plotId !== 'all' && row.plotId !== filters.plotId) return false;
+        if (filters.validity !== 'all' && row.validity !== filters.validity) return false;
         if (filters.from !== '' && row.date < filters.from) return false;
         if (filters.to !== '' && row.date > filters.to) return false;
         if (filters.level !== 'all') {
@@ -101,12 +125,14 @@ export default function SurveyBoard() {
   const plotName = (plotId: string): string => plots.find((item) => item.id === plotId)?.name ?? '（地块已删除）';
 
   const stats = useMemo(() => {
-    const rated = plots.filter((plot) => statOf(plot.id).surveyCount > 0);
+    const rated = plots.filter((plot) => statOf(plot.id).effectiveSurveyCount > 0);
     const warn = rated.filter((plot) => statOf(plot.id).latestRate < SURVIVAL_WARN_RATE);
     const strong = rated.filter((plot) => statOf(plot.id).latestRate >= 85);
     return {
       ratedCount: rated.length,
       warnCount: warn.length,
+      staleCount: plots.reduce((acc, plot) => acc + statOf(plot.id).staleCount, 0),
+      unprovenCount: plots.reduce((acc, plot) => acc + statOf(plot.id).unprovenCount, 0),
       strongCount: strong.length,
       strongPct: rated.length === 0 ? 0 : Math.round((strong.length / rated.length) * 1000) / 10,
       avgRate:
@@ -155,13 +181,13 @@ export default function SurveyBoard() {
       };
       if (editing === null) {
         const row = await createSurvey(payload);
-        message.success(`已录入第 ${row.round} 测次，成活率 ${row.survivalRate}%`);
+        message.success(`已录入第 ${row.round} 测次，固定株数 ${row.plantedCount ?? 0} 株，成活率 ${row.survivalRate}%`);
         if (row.survivalRate < SURVIVAL_WARN_RATE) {
           message.warning(`成活率 ${row.survivalRate}% 低于告警阈值 ${SURVIVAL_WARN_RATE}%，建议生成补植计划`, 6);
         }
       } else {
         await updateSurvey(editing.id, payload);
-        message.success('验收记录已更新');
+        message.success('验收记录已更新（当次栽植株数快照保持不变）');
       }
       setOpen(false);
     } catch (error) {
@@ -187,7 +213,50 @@ export default function SurveyBoard() {
       return;
     }
     const result = await generateReplant(plotId);
-    message.success(result);
+    message[result.includes('无缺株') || result.includes('没有有效') ? 'info' : 'success'](result);
+  };
+
+  const handleKeep = async (record: Survey): Promise<void> => {
+    try {
+      const kept = await review(record.id, 'keep');
+      if (kept === null) return;
+      message.success(`第 ${record.round} 测次已保留原株数快照 ${kept.plantedCount ?? '—'} 株，恢复有效`);
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '复核失败');
+    }
+  };
+
+  const handleRecompute = async (record: Survey): Promise<void> => {
+    const current = plantings
+      .filter((row) => row.plotId === record.plotId)
+      .reduce((acc, row) => acc + row.count, 0);
+    try {
+      const next = await review(record.id, 'recompute');
+      if (next === null) return;
+      message.success(
+        `第 ${record.round} 测次已按当前栽植总株数 ${current} 株重算，成活率 ${next.survivalRate}%`,
+      );
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '重算失败');
+    }
+  };
+
+  const openProve = (record: Survey): void => {
+    setProving(record);
+    setProvenCount(record.plantedCount ?? null);
+  };
+
+  const handleProve = async (): Promise<void> => {
+    if (proving === null) return;
+    if (provenCount === null || provenCount <= 0) {
+      message.warning('请填写能证明的当次栽植株数');
+      return;
+    }
+    const next = await review(proving.id, 'prove', provenCount);
+    message.success(
+      `第 ${proving.round} 测次已补证为 ${provenCount} 株，成活率 ${next?.survivalRate ?? '—'}%，恢复有效`,
+    );
+    setProving(null);
   };
 
   const columns: ColumnsType<Survey> = [
@@ -199,7 +268,10 @@ export default function SurveyBoard() {
         <Space direction="vertical" size={0}>
           <span>{plotName(record.plotId)}</span>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            栽植总株数 {statOf(record.plotId).plantTotal.toLocaleString('zh-CN')} 株
+            当前栽植 {statOf(record.plotId).plantTotal.toLocaleString('zh-CN')} 株
+            {record.plantedCount !== null && record.plantedCount !== statOf(record.plotId).plantTotal ? (
+              <span>（当次固定 {record.plantedCount.toLocaleString('zh-CN')} 株）</span>
+            ) : null}
           </Typography.Text>
         </Space>
       ),
@@ -223,12 +295,23 @@ export default function SurveyBoard() {
       render: (value: number) => value.toLocaleString('zh-CN'),
     },
     {
+      title: '固定株数',
+      dataIndex: 'plantedCount',
+      key: 'plantedCount',
+      width: 110,
+      align: 'right',
+      render: (value: number | null) => (value === null ? <Tag color="red">待补证</Tag> : value.toLocaleString('zh-CN')),
+    },
+    {
       title: '成活率',
       key: 'rate',
       width: 180,
       render: (_value, record) => {
         const summary = summaryOf(record.plotId);
         const point = summary.points.find((item) => item.surveyId === record.id);
+        if (record.validity === 'unproven') {
+          return <Tag icon={<FileSearchOutlined />} color="red">待补证，成活率不可用</Tag>;
+        }
         return (
           <RateTag
             rate={point?.rate ?? record.survivalRate}
@@ -265,11 +348,64 @@ export default function SurveyBoard() {
       },
     },
     {
+      title: '有效性',
+      key: 'validity',
+      width: 130,
+      render: (_value, record) => (
+        <TooltipValidity record={record} />
+      ),
+    },
+    {
       title: '等级来源',
       key: 'gradeSource',
       width: 110,
       render: (_value, record) =>
         record.gradeManual ? <Tag color="purple">人工复核</Tag> : <Tag>自动判定</Tag>,
+    },
+    {
+      title: '复核操作',
+      key: 'review',
+      width: 170,
+      render: (_value, record) => {
+        if (record.validity === 'unproven') {
+          return (
+            <Button size="small" type="link" icon={<SafetyCertificateOutlined />} onClick={() => openProve(record)}>
+              补证株数
+            </Button>
+          );
+        }
+        if (record.validity === 'stale') {
+          const current = plantings
+            .filter((row) => row.plotId === record.plotId)
+            .reduce((acc, row) => acc + row.count, 0);
+          const preview = calcSurvivalRate(record.aliveCount, current);
+          return (
+            <Dropdown
+              menu={{
+                items: [
+                  {
+                    key: 'keep',
+                    icon: <HistoryOutlined />,
+                    label: `保留原测次（${record.plantedCount ?? '—'} 株，${record.survivalRate}%）`,
+                    onClick: () => void handleKeep(record),
+                  },
+                  {
+                    key: 'recompute',
+                    icon: <RiseOutlined />,
+                    label: `按新株数重算（${current} 株，${preview}%）`,
+                    onClick: () => void handleRecompute(record),
+                  },
+                ],
+              }}
+            >
+              <Button size="small" type="link" icon={<SafetyCertificateOutlined />}>
+                去复核
+              </Button>
+            </Dropdown>
+          );
+        }
+        return <Typography.Text type="secondary" style={{ fontSize: 12 }}>已确认有效</Typography.Text>;
+      },
     },
     {
       title: '操作',
@@ -282,13 +418,13 @@ export default function SurveyBoard() {
           </Button>
           <Popconfirm
             title="确认删除该测次记录？"
+            description="以它为来源的未完成补植计划会退出有效范围。"
             okText="删除"
             okButtonProps={{ danger: true }}
             cancelText="取消"
             onConfirm={async () => {
               await deleteSurvey(record.id);
-              await remove(record.id);
-              message.success('验收记录已删除');
+              message.success('验收记录已删除，缺株数已重新对账');
             }}
           >
             <Button size="small" type="link" danger icon={<DeleteOutlined />}>
@@ -302,42 +438,60 @@ export default function SurveyBoard() {
 
   const warnPlots = plots.filter((plot) => {
     const stat = statOf(plot.id);
-    return stat.surveyCount > 0 && stat.latestRate < SURVIVAL_WARN_RATE;
+    return stat.effectiveSurveyCount > 0 && stat.latestRate < SURVIVAL_WARN_RATE;
   });
 
   return (
     <div>
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 14 }}>
         <StatBadge label="验收记录" value={rows.length} suffix="条" tone="primary" icon={<ExperimentOutlined />} />
-        <StatBadge label="已验收地块" value={stats.ratedCount} suffix="块" tone="info" />
+        <StatBadge label="有效验收地块" value={stats.ratedCount} suffix="块" tone="info" />
         <StatBadge label="平均成活率" value={percentText(stats.avgRate)} percent={stats.avgRate} tone="success" />
+        <StatBadge label="优秀地块占比" value={percentText(stats.strongPct)} percent={stats.strongPct} tone="primary" />
         <StatBadge
-          label="优秀地块占比"
-          value={percentText(stats.strongPct)}
-          percent={stats.strongPct}
-          tone="primary"
-          hint="最新成活率 ≥ 85% 的地块占比"
+          label="待复核测次"
+          value={stats.staleCount}
+          suffix="条"
+          tone={stats.staleCount > 0 ? 'warning' : 'default'}
+          hint="栽植记录变化后等待人工保留或重算的测次"
+        />
+        <StatBadge
+          label="待补证测次"
+          value={stats.unprovenCount}
+          suffix="条"
+          tone={stats.unprovenCount > 0 ? 'danger' : 'default'}
+          hint="旧数据无法证明当次栽植株数，补证后才恢复有效"
         />
         <StatBadge
           label="告警地块"
           value={stats.warnCount}
           suffix="块"
           tone={stats.warnCount > 0 ? 'danger' : 'default'}
-          hint={`最新成活率低于 ${SURVIVAL_WARN_RATE}% 的地块`}
+          hint={`最新有效成活率低于 ${SURVIVAL_WARN_RATE}% 的地块`}
         />
       </div>
+
+      {stats.staleCount + stats.unprovenCount > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`${stats.staleCount} 个测次待复核、${stats.unprovenCount} 个测次待补证`}
+          description="每次验收固定保存当次栽植株数，事后补录/修订栽植不会改动历史成活率。请在「复核操作」列选择保留原测次或按新株数重算；旧数据无法证明株数的测次请人工补证，补证前不参与告警与缺株对账。"
+        />
+      ) : null}
 
       {warnPlots.length > 0 ? (
         <Alert
           type="warning"
           showIcon
           style={{ marginBottom: 14 }}
-          message={`有 ${warnPlots.length} 个地块的最新成活率低于 ${SURVIVAL_WARN_RATE}%`}
+          message={`有 ${warnPlots.length} 个地块的最新有效成活率低于 ${SURVIVAL_WARN_RATE}%`}
           description={
             <Space direction="vertical" size={2}>
               {warnPlots.map((plot) => (
                 <span key={plot.id}>
-                  {plot.name}：最新成活率 {percentText(statOf(plot.id).latestRate)}，建议补植{' '}
+                  {plot.name}：最新有效成活率 {percentText(statOf(plot.id).latestRate)}，建议补植{' '}
                   {statOf(plot.id).suggestReplant} 株
                 </span>
               ))}
@@ -369,6 +523,21 @@ export default function SurveyBoard() {
               options={[
                 { value: 'all', label: '全部地块' },
                 ...plots.map((plot) => ({ value: plot.id, label: plot.name })),
+              ]}
+            />
+          </Space>
+          <Space size={6}>
+            <span style={{ color: '#5b6b66', fontSize: 13 }}>有效性</span>
+            <Select
+              style={{ minWidth: 130 }}
+              value={filters.validity}
+              onChange={(value: string) => setFilters({ validity: value as SurveyValidity | 'all' })}
+              options={[
+                { value: 'all', label: '全部状态' },
+                ...(['effective', 'stale', 'unproven'] as SurveyValidity[]).map((value) => ({
+                  value,
+                  label: SURVEY_VALIDITY_LABEL[value],
+                })),
               ]}
             />
           </Space>
@@ -425,7 +594,7 @@ export default function SurveyBoard() {
         {rows.length === 0 && !loading ? (
           <EmptyPanel
             title="还没有任何验收记录"
-            description="按测次录入成活株数与平均株高，系统会自动计算成活率并在低于阈值时告警。"
+            description="按测次录入成活株数与平均株高，保存时固定当次栽植株数并自动计算成活率，低于阈值时告警。"
             actionText="录入第一个测次"
             onAction={openCreate}
           />
@@ -436,7 +605,7 @@ export default function SurveyBoard() {
             loading={loading || !ready}
             columns={columns}
             dataSource={filtered}
-            scroll={{ x: 1280 }}
+            scroll={{ x: 1560 }}
             rowSelection={{
               selectedRowKeys: selectedIds,
               onChange: (keys) => setSelectedIds(keys.map((key) => String(key))),
@@ -491,10 +660,64 @@ export default function SurveyBoard() {
             </Form.Item>
           </Space>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            成活率 = 成活株数 / 该地块栽植总株数，保存时自动计算；成活率低于 {SURVIVAL_WARN_RATE}% 会给出告警提示。
+            成活率 = 成活株数 / 当次栽植株数，保存时把当时的栽植总株数固定下来；之后即便补录或修订栽植记录，
+            本测次成活率也不再变化，而是等待复核时选择保留或重算。成活率低于 {SURVIVAL_WARN_RATE}% 会给出告警提示。
           </Typography.Text>
         </Form>
       </Modal>
+
+      <Modal
+        title={proving ? `第 ${proving.round} 测次 · 人工补证当次栽植株数` : ''}
+        open={proving !== null}
+        onCancel={() => setProving(null)}
+        onOk={() => void handleProve()}
+        okText="补证并恢复有效"
+        cancelText="取消"
+      >
+        {proving ? (
+          <Space direction="vertical" size={10} style={{ width: '100%' }}>
+            <Typography.Text>
+              该测次为旧数据升级遗留，无法由历史成活率反推出可靠的当次栽植株数。请依据验收单据 / 现场记录补证：
+            </Typography.Text>
+            <InputNumber
+              autoFocus
+              min={1}
+              max={500000}
+              step={100}
+              style={{ width: '100%' }}
+              value={provenCount}
+              onChange={(value) => setProvenCount(value)}
+              placeholder="当次验收时实际栽植总株数"
+            />
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              当前记录成活 {proving.aliveCount.toLocaleString('zh-CN')} 株；补证后成活率将按
+              {provenCount && provenCount > 0
+                ? ` ${calcSurvivalRate(proving.aliveCount, provenCount)}% `
+                : ' 补证株数 '}
+              重新计算，测次恢复有效并重新纳入缺株对账。
+            </Typography.Text>
+          </Space>
+        ) : null}
+      </Modal>
     </div>
+  );
+}
+
+/** 有效性标签（带说明） */
+function TooltipValidity({ record }: { record: Survey }) {
+  const hint: Record<SurveyValidity, string> = {
+    effective: '株数快照可证，成活率按当次固定株数计算',
+    stale: '栽植记录已变化：保留着原测次快照，等待人工保留或重算',
+    unproven: '旧数据无法证明当次栽植株数，补证前不参与对账',
+  };
+  return (
+    <Space direction="vertical" size={0}>
+      <Tag color={VALIDITY_COLOR[record.validity]} icon={record.validity === 'effective' ? undefined : <FileSearchOutlined />}>
+        {SURVEY_VALIDITY_LABEL[record.validity]}
+      </Tag>
+      <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+        {hint[record.validity]}
+      </Typography.Text>
+    </Space>
   );
 }
